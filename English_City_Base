@@ -1,0 +1,251 @@
+import gradio as gr
+import requests
+from bs4 import BeautifulSoup
+from urllib.parse import quote
+from dataclasses import dataclass
+from typing import List, Tuple, Dict
+import datetime as dt
+import os
+import re
+try:
+    from selenium import webdriver
+    from selenium.webdriver.chrome.options import Options as ChromeOptions
+    from selenium.webdriver.chrome.service import Service as ChromeService
+    from selenium.webdriver.common.by import By
+    from webdriver_manager.chrome import ChromeDriverManager
+    _SELENIUM_AVAILABLE = True
+except Exception:
+    _SELENIUM_AVAILABLE = False
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    )
+}
+
+# --- Configure ~5 cities (feel free to edit) --- #
+LOCATIONS: Dict[str, Dict[str, str]] = {
+    "London": {"wttr": "London", "tad_country": "uk", "tad_city": "london"},
+    "Manchester": {"wttr": "Manchester", "tad_country": "uk", "tad_city": "manchester"},
+    "Birmingham": {"wttr": "Birmingham", "tad_country": "uk", "tad_city": "birmingham"},
+    "Leeds": {"wttr": "Leeds", "tad_country": "uk", "tad_city": "leeds"},
+    "Bristol": {"wttr": "Bristol", "tad_country": "uk", "tad_city": "bristol"},
+}
+
+# ------------------ Weather scraping ------------------ #
+
+def fetch_weather_wttr(city: str) -> Dict[str, str]:
+    """Fetch current weather from wttr.in JSON (no API key).
+    Returns a dict with temperature, feels_like, desc, humidity, wind.
+    """
+    url = f"https://wttr.in/{quote(city)}?format=j1"
+    r = requests.get(url, headers=HEADERS, timeout=12)
+    r.raise_for_status()
+    data = r.json()
+    cur = data["current_condition"][0]
+    desc = ", ".join([w["value"] for w in cur.get("weatherDesc", []) if w.get("value")])
+    return {
+        "temp_c": cur.get("temp_C", "?"),
+        "feels_c": cur.get("FeelsLikeC", "?"),
+        "desc": desc or "-",
+        "humidity": cur.get("humidity", "?"),
+        "wind_kmph": cur.get("windspeedKmph", "?"),
+        "obs_time": cur.get("localObsDateTime", ""),
+        "source": "wttr.in",
+    }
+
+
+def fetch_weather_selenium(city_key: str) -> Dict[str, str]:
+    """Scrape current weather using Selenium from timeanddate.com.
+    Falls back to wttr if Selenium isn't available.
+    """
+    if not _SELENIUM_AVAILABLE:
+        return fetch_weather_wttr(city_key)
+
+    conf = LOCATIONS[city_key]
+    url = f"https://www.timeanddate.com/weather/{conf['tad_country']}/{conf['tad_city']}"
+
+    opts = ChromeOptions()
+    opts.add_argument("--headless=new")
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+
+    driver = webdriver.Chrome(service=ChromeService(ChromeDriverManager().install()), options=opts)
+    driver.set_page_load_timeout(20)
+    try:
+        driver.get(url)
+        # Temperature often in #qlook .h2, description in #qlook p
+        temp = driver.find_element(By.CSS_SELECTOR, "#qlook .h2").text
+        desc = driver.find_element(By.CSS_SELECTOR, "#qlook p").text
+        # Tidy values
+        temp_c_match = re.search(r"(-?\d+)\s*°C", temp)
+        temp_c = temp_c_match.group(1) if temp_c_match else temp
+        result = {
+            "temp_c": temp_c,
+            "feels_c": "-",
+            "desc": desc.strip(),
+            "humidity": "-",
+            "wind_kmph": "-",
+            "obs_time": dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "source": "timeanddate.com (Selenium)",
+        }
+    finally:
+        driver.quit()
+    return result
+
+# ------------------ Wikipedia scraping (restaurants/pubs) ------------------ #
+
+@dataclass
+class Place:
+    name: str
+    url: str
+
+
+def _wikipedia_first_result_url(query: str) -> str | None:
+    """Get the first Wikipedia search result URL (HTML search page parsed with BS4)."""
+    s_url = "https://en.wikipedia.org/w/index.php?search=" + quote(query)
+    r = requests.get(s_url, headers=HEADERS, timeout=12)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "lxml")
+    hit = soup.select_one(".mw-search-result-heading a")
+    if hit and hit.get("href", "").startswith("/wiki/"):
+        return "https://en.wikipedia.org" + hit.get("href")
+    # If the search directly redirects, there is no search result list — try canonical link
+    canonical = soup.select_one('link[rel="canonical"]')
+    if canonical and canonical.get("href", "").startswith("https://en.wikipedia.org/wiki/"):
+        return canonical["href"]
+    return None
+
+
+def _parse_places_from_wiki_page(page_html: str, limit: int = 12) -> List[Place]:
+    soup = BeautifulSoup(page_html, "lxml")
+    results: List[Place] = []
+
+    # Strategy 1: tables with class wikitable
+    for table in soup.select("table.wikitable"):
+        for a in table.select("tbody tr td a[href^='/wiki/']"):
+            title = a.get_text(strip=True)
+            href = a.get("href")
+            if title and len(title) > 2 and not title.startswith("["):
+                results.append(Place(title, "https://en.wikipedia.org" + href))
+                if len(results) >= limit:
+                    return results
+
+    # Strategy 2: bullet lists near the top content
+    content = soup.select_one(".mw-parser-output")
+    if content:
+        for ul in content.find_all("ul", recursive=False)[:8]:
+            for li in ul.select("li"):
+                a = li.find("a", href=True)
+                if not a:
+                    continue
+                title = a.get_text(strip=True)
+                href = a.get("href")
+                if href.startswith("/wiki/") and title and len(title) > 2:
+                    # Filter obviously non-place links
+                    if any(x in title.lower() for x in ["coordinates", "list of", "category:"]):
+                        continue
+                    results.append(Place(title, "https://en.wikipedia.org" + href))
+                    if len(results) >= limit:
+                        return results
+
+    return results[:limit]
+
+
+def fetch_places_from_wikipedia(city: str, topic: str, limit: int = 12) -> List[Place]:
+    """Scrape a handful of place names (restaurants or pubs) from Wikipedia.
+    We'll try a few search queries and parse whichever page gives usable results.
+    """
+    queries = [
+        f"List of {topic} in {city}",
+        f"{topic.title()} in {city}",
+        f"Notable {topic} in {city}",
+    ]
+
+    for q in queries:
+        url = _wikipedia_first_result_url(q)
+        if not url:
+            continue
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=12)
+            r.raise_for_status()
+            places = _parse_places_from_wiki_page(r.text, limit=limit)
+            if places:
+                return places
+        except Exception:
+            continue
+
+    return []
+
+# ------------------ Gradio glue ------------------ #
+
+ENGINE_CHOICES = ["Requests + BeautifulSoup", "Selenium (experimental)"]
+TOPIC_CHOICES = ["restaurants", "pubs"]
+
+
+def render_weather_md(city_key: str, engine: str) -> str:
+    try:
+        if engine.startswith("Selenium"):
+            data = fetch_weather_selenium(city_key)
+        else:
+            data = fetch_weather_wttr(LOCATIONS[city_key]["wttr"])
+        lines = [
+            f"### 🌤️ Weather now — {city_key}",
+            f"**Temp:** {data['temp_c']}°C  |  **Feels like:** {data['feels_c']}°C",
+            f"**Conditions:** {data['desc']}",
+            f"**Humidity:** {data['humidity']}%  |  **Wind:** {data['wind_kmph']} km/h",
+            f"<sub>Source: {data['source']} • Updated {dt.datetime.now().strftime('%Y-%m-%d %H:%M')}</sub>",
+        ]
+        return "\n".join(lines)
+    except Exception as e:
+        return f"### Weather\nSorry, couldn't fetch weather for **{city_key}**.\n\n``{e}``"
+
+
+def render_places_md(city_key: str, topics: List[str]) -> str:
+    city = city_key
+    sections: List[str] = []
+    for topic in topics:
+        try:
+            places = fetch_places_from_wikipedia(city, topic)
+            if not places:
+                sections.append(f"#### {topic.title()}\n_No {topic} found from Wikipedia scrape._")
+                continue
+            bullets = "\n".join([f"- [{p.name}]({p.url})" for p in places])
+            sections.append(f"#### {topic.title()}\n{bullets}")
+        except Exception as e:
+            sections.append(f"#### {topic.title()}\nScrape error: `{e}`")
+    return "\n\n".join(sections) if sections else "_No topics selected._"
+
+
+def on_city_click(city_key: str, engine: str, topics: List[str]):
+    weather = render_weather_md(city_key, engine)
+    places = render_places_md(city_key, topics or [])
+    return weather, places
+
+
+with gr.Blocks(title="City Snap — Weather & Places", theme=gr.themes.Soft()) as demo:
+    gr.Markdown("""
+    # 🗺️ City Snap — quick picks
+    Click a city to see **live weather** and a handful of **notable restaurants/pubs** scraped from Wikipedia.
+    
+    - Engine: *Requests + BeautifulSoup* by default. Selenium is optional and heavier.
+    - Edit the city list in `LOCATIONS` at the top of the file.
+    """)
+
+    with gr.Row():
+        engine = gr.Dropdown(ENGINE_CHOICES, value=ENGINE_CHOICES[0], label="Weather engine")
+        topics = gr.CheckboxGroup(TOPIC_CHOICES, value=["restaurants", "pubs"], label="Places to fetch")
+
+    with gr.Row():
+        btns = []
+        for city in LOCATIONS.keys():
+            btns.append(gr.Button(f"{city}", variant="primary"))
+
+    weather_md = gr.Markdown(visible=True)
+    places_md = gr.Markdown(visible=True)
+
+    for i, city in enumerate(LOCATIONS.keys()):
+        btns[i].click(on_city_click, inputs=[gr.State(city), engine, topics], outputs=[weather_md, places_md])
+
+if __name__ == "__main__":
+    demo.launch()
