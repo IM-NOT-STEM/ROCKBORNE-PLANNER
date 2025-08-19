@@ -1,0 +1,242 @@
+from dotenv import load_dotenv, find_dotenv
+load_dotenv(find_dotenv(), override=True)
+
+import os, urllib.parse, requests
+import gradio as gr
+
+"""
+Holiday Planner with Google Maps Embed + Google Weather API (no scraping).
+- Enter a destination and a nightlife category.
+- We geocode with Nominatim (free) to get lat/lon.
+- Weather from Google Maps Platform Weather API: current + daily forecast.
+Docs:
+  - Current conditions: https://weather.googleapis.com/v1/currentConditions:lookup
+  - Daily forecast:     https://weather.googleapis.com/v1/forecast/days:lookup
+"""
+
+DEFAULT_DEST = "Cancún, Mexico"
+CATEGORIES = ["nightclubs", "restaurants", "bars", "live music", "beach clubs", "cafes"]
+UNITS = ["METRIC", "IMPERIAL"]  # Weather API supports both
+
+# ---------- Google Maps Embed ----------
+
+def build_embed_url(destination: str, category: str, zoom: int = 13, maptype: str = "roadmap") -> str:
+    api_key = os.getenv("GOOGLE_MAPS_API_KEY", "")
+    if not api_key:
+        return ""
+    q = f"{category} near {destination}".strip()
+    q_enc = urllib.parse.quote(q)
+    base = "https://www.google.com/maps/embed/v1/search"
+    url = f"{base}?key={api_key}&q={q_enc}&zoom={zoom}&maptype={maptype}"
+    return url
+
+def make_iframe(url: str, height: int = 600) -> str:
+    if not url:
+        return "<div style='color:red;padding:1rem'>Error: Missing GOOGLE_MAPS_API_KEY environment variable.</div>"
+    return f"""
+    <iframe
+      width="100%"
+      height="{height}"
+      frameborder="0" style="border:0"
+      referrerpolicy="no-referrer-when-downgrade"
+      allowfullscreen
+      src="{url}">
+    </iframe>
+    """
+
+# ---------- Geocode (Nominatim) ----------
+
+def geocode_destination(dest: str):
+    """
+    Returns dict with lat, lon, display_name, country, country_code.
+    """
+    url = "https://nominatim.openstreetmap.org/search"
+    r = requests.get(
+        url,
+        params={"q": dest, "format": "json", "limit": 1, "addressdetails": 1},
+        headers={"User-Agent": "holiday-planner/1.0"},
+        timeout=15,
+    )
+    r.raise_for_status()
+    arr = r.json()
+    if not arr:
+        return None
+    x = arr[0]
+    addr = x.get("address", {})
+    return {
+        "lat": float(x["lat"]),
+        "lon": float(x["lon"]),
+        "display_name": x.get("display_name", dest),
+        "country": addr.get("country"),
+        "country_code": addr.get("country_code"),
+    }
+
+# ---------- Google Weather API helpers ----------
+
+def _gw_key() -> str:
+    k = os.getenv("GOOGLE_MAPS_API_KEY", "")
+    if not k:
+        raise RuntimeError("GOOGLE_MAPS_API_KEY not set. Add it to .env")
+    return k
+
+def google_weather_current(lat: float, lon: float, units_system: str = "METRIC") -> dict:
+    """
+    Calls: /v1/currentConditions:lookup
+    Returns a small dict with humidity, wind, clouds, temperature, etc.
+    """
+    url = "https://weather.googleapis.com/v1/currentConditions:lookup"
+    params = {
+        "key": _gw_key(),
+        "location.latitude": lat,
+        "location.longitude": lon,
+        "unitsSystem": units_system,
+    }
+    r = requests.get(url, params=params, timeout=15)
+    r.raise_for_status()
+    j = r.json()
+
+    # Extract commonly-used fields (defensive in case fields are missing)
+    wc = j.get("weatherCondition", {})
+    wind = j.get("wind", {}) or {}
+    wind_speed = (wind.get("speed") or {}).get("value")
+    gust_speed = (wind.get("gust") or {}).get("value")
+    out = {
+        "currentTime": j.get("currentTime"),
+        "isDaytime": j.get("isDaytime"),
+        "condition": (wc.get("description") or {}).get("text"),
+        "temp": (j.get("temperature") or {}).get("degrees"),
+        "feels_like": (j.get("feelsLikeTemperature") or {}).get("degrees"),
+        "humidity": j.get("relativeHumidity"),
+        "uv_index": j.get("uvIndex"),
+        "precip_prob": ((j.get("precipitation") or {}).get("probability") or {}).get("percent"),
+        "pressure_mbar": ((j.get("airPressure") or {}).get("meanSeaLevelMillibars")),
+        "visibility": ((j.get("visibility") or {}).get("distance")),
+        "cloud_cover": j.get("cloudCover"),
+        "wind_kmh": wind_speed if units_system == "METRIC" else None,
+        "wind_mph": wind_speed if units_system == "IMPERIAL" else None,
+        "gust_kmh": gust_speed if units_system == "METRIC" else None,
+        "gust_mph": gust_speed if units_system == "IMPERIAL" else None,
+    }
+    return out
+
+def google_weather_daily(lat: float, lon: float, days: int = 5, units_system: str = "METRIC") -> dict:
+    """
+    Calls: /v1/forecast/days:lookup
+    Returns lists for display (max/min temp, wind, humidity, cloud cover per day).
+    """
+    url = "https://weather.googleapis.com/v1/forecast/days:lookup"
+    params = {
+        "key": _gw_key(),
+        "location.latitude": lat,
+        "location.longitude": lon,
+        "days": max(1, min(days, 10)),  # API supports up to 10
+        "unitsSystem": units_system,
+    }
+    r = requests.get(url, params=params, timeout=15)
+    r.raise_for_status()
+    j = r.json()
+
+    out = {"days": []}
+    for d in j.get("forecastDays", []):
+        label = d.get("displayDate") or {}
+        # daytime/nighttime forecast blocks
+        dayf = d.get("daytimeForecast") or {}
+        nightf = d.get("nighttimeForecast") or {}
+        wind = (dayf.get("wind") or {})
+        speed = (wind.get("speed") or {}).get("value")  # already in unitsSystem
+        out["days"].append({
+            "date": f"{label.get('year','')}-{str(label.get('month','')).zfill(2)}-{str(label.get('day','')).zfill(2)}",
+            "tmax": (d.get("maxTemperature") or {}).get("degrees"),
+            "tmin": (d.get("minTemperature") or {}).get("degrees"),
+            "humidity_day": dayf.get("relativeHumidity"),
+            "humidity_night": nightf.get("relativeHumidity"),
+            "cloud_day": dayf.get("cloudCover"),
+            "cloud_night": nightf.get("cloudCover"),
+            "wind": speed,
+        })
+    return out
+
+def weather_for_destination(dest: str, units_system: str = "METRIC", forecast_days: int = 5) -> dict:
+    geo = geocode_destination(dest)
+    if not geo:
+        return {"error": f"Couldn't geocode destination: {dest}"}
+    cur = google_weather_current(geo["lat"], geo["lon"], units_system=units_system)
+    dly = google_weather_daily(geo["lat"], geo["lon"], days=forecast_days, units_system=units_system)
+    return {"geocoding": geo, "current": cur, "daily": dly, "units": units_system}
+
+# ---------- Gradio glue ----------
+
+def generate_map_and_weather(dest, category, zoom, maptype, iframe_height, units_system, days):
+    # Map
+    map_url = build_embed_url(dest or DEFAULT_DEST, category, zoom, maptype)
+    map_html = make_iframe(map_url, iframe_height)
+
+    # Weather (Google Weather API)
+    try:
+        data = weather_for_destination(dest or DEFAULT_DEST, units_system=units_system, forecast_days=days)
+    except Exception as e:
+        return map_html, f"### Weather\n❌ {e}"
+
+    if "error" in data:
+        return map_html, f"### Weather\n❌ {data['error']}"
+
+    g, c, d = data["geocoding"], data["current"], data["daily"]
+    units = data["units"]
+
+    # Compose Markdown
+    lines = [
+        f"### 🌤️ Weather — **{g.get('display_name', dest or DEFAULT_DEST)}**",
+        f"- **Coords:** {g['lat']:.4f}, {g['lon']:.4f}  |  **Country:** {g.get('country','—')}",
+        f"- **Now:** {c.get('temp','—')}° ({units}) • {c.get('condition','—')}",
+        f"- **Feels like:** {c.get('feels_like','—')}° • **Humidity:** {c.get('humidity','—')}% • **Cloud cover:** {c.get('cloud_cover','—')}%",
+    ]
+    if units == "METRIC":
+        lines.append(f"- **Wind:** {c.get('wind_kmh','—')} km/h  (gusts {c.get('gust_kmh','—')} km/h)")
+    else:
+        lines.append(f"- **Wind:** {c.get('wind_mph','—')} mph  (gusts {c.get('gust_mph','—')} mph)")
+    if c.get("pressure_mbar") is not None:
+        lines.append(f"- **Pressure:** {c['pressure_mbar']} mbar")
+    if c.get("uv_index") is not None:
+        lines.append(f"- **UV index:** {c['uv_index']}")
+    if c.get("precip_prob") is not None:
+        lines.append(f"- **Precip chance:** {c['precip_prob']}%")
+
+    if d.get("days"):
+        lines.append("\n**Next days (max/min, wind):**")
+        for x in d["days"]:
+            w = f"{x.get('wind','—')} {'km/h' if units=='METRIC' else 'mph'}"
+            lines.append(f"- {x['date']}: {x.get('tmax','—')}° / {x.get('tmin','—')}° • wind {w}")
+
+    lines.append("\n<sub>Source: Google Maps Platform Weather API.</sub>")
+    md = "\n".join(lines)
+    return map_html, md
+
+with gr.Blocks(title="Holiday Planner • Nightlife + Google Weather") as demo:
+    gr.Markdown("# Holiday Planner")
+    gr.Markdown("Type a tropical destination and pick a category to find nearby nightlife spots on the map. "
+                "Weather is fetched from **Google Maps Platform Weather API** (no scraping).")
+
+    with gr.Row():
+        dest = gr.Textbox(label="Destination", value=DEFAULT_DEST, placeholder="e.g., Phuket, Thailand")
+        category = gr.Dropdown(CATEGORIES, value="nightclubs", label="Category")
+    with gr.Row():
+        zoom = gr.Slider(3, 20, value=13, step=1, label="Zoom")
+        maptype = gr.Dropdown(["roadmap", "satellite", "terrain", "hybrid"], value="roadmap", label="Map Type")
+        iframe_height = gr.Slider(300, 900, value=600, step=10, label="Map Height (px)")
+    with gr.Row():
+        units_system = gr.Dropdown(UNITS, value="METRIC", label="Units")
+        days = gr.Slider(1, 10, value=5, step=1, label="Forecast days")
+
+    out_map = gr.HTML(label="Map")
+    out_weather = gr.Markdown(label="Weather")
+    run_btn = gr.Button("Show on Map + Weather", variant="primary")
+
+    run_btn.click(
+        fn=generate_map_and_weather,
+        inputs=[dest, category, zoom, maptype, iframe_height, units_system, days],
+        outputs=[out_map, out_weather],
+    )
+
+if __name__ == "__main__":
+    demo.launch()
+
